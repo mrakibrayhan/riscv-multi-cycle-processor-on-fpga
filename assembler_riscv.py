@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RV32I base-ISA assembler for the RISC-V single-cycle CPU project (v2).
+RV32I / RV32IM assembler for the RISC-V CPUs (RISC-V-SC, RISC-V-MC, RISC-V-P)  (v3).
 
 Syntax is standard RISC-V assembler style:
 
@@ -33,16 +33,25 @@ Syntax is standard RISC-V assembler style:
   Directives: ".data" starts the data section (one 32-bit value per line,
               decimal or 0x-hex, optional "label:" prefix); ".text" is ignored.
 
-NOT supported (they decode as illegal on the 37-instruction core):
-  fence, ecall, ebreak, and the CSR instructions.
+  M extension : mul mulh mulhsu mulhu div divu rem remu     "mul rd, rs1, rs2"
+                (only with --isa rv32im; --isa zmmul allows only the four mul* forms; --isa rv32i allows none)
+  System      : ecall, ebreak   (they HALT the CPU; no operands)
+
+NOT supported (they decode as illegal on these cores):
+  fence and the CSR instructions.
+
+Which --isa for which core (default rv32im):
+  RISC-V-SC : rv32i   (rv32i + Zmmul only if the core is built with ENABLE_ZMMUL = 1  ->  --isa zmmul)
+  RISC-V-MC : rv32im  (ENABLE_M = 1)   zmmul if ENABLE_M = 2   rv32i if ENABLE_M = 0
+  RISC-V-P  : rv32im  (ENABLE_M = 1)   zmmul if ENABLE_M = 2   rv32i if ENABLE_M = 0
 
 Usage:
   python3 assembler_riscv.py program.asm [--imem-depth 128] [--dmem-depth 32]
-                                         [--outdir DIR]
+                                         [--outdir DIR] [--isa rv32i|zmmul|rv32im]
 
 Writes program.hex (imem contents, padded to --imem-depth words) and
 data.hex (dmem contents, padded to --dmem-depth words). If the program
-does not end with a "jal x0, ..." an automatic self-loop (jal x0,0 =
+does not end with a "jal x0, ...", ecall or ebreak an automatic self-loop (jal x0,0 =
 0x0000006F) is appended - this is the "halted" convention the status
 LED / ISSP bit uses. The program INCLUDING that appended word must fit in
 --imem-depth words, otherwise the assembler stops with an error (the CPU's
@@ -97,6 +106,9 @@ R_FUNCT = {
     'SRL': (0b101, 0b0000000), 'SRA': (0b101, 0b0100000),
     'OR': (0b110, 0b0000000), 'AND': (0b111, 0b0000000),
 }
+M_FUNCT = {'MUL': 0b000, 'MULH': 0b001, 'MULHSU': 0b010, 'MULHU': 0b011,
+           'DIV': 0b100, 'DIVU': 0b101, 'REM': 0b110, 'REMU': 0b111}   # funct7 = 0000001
+ISA_MODE = {'isa': 'rv32im'}
 ITYPE_FUNCT3 = {
     'ADDI': 0b000, 'SLTI': 0b010, 'SLTIU': 0b011,
     'XORI': 0b100, 'ORI': 0b110, 'ANDI': 0b111,
@@ -266,7 +278,13 @@ def _imm_range_check(name, imm):
 def encode_rtype(mnemonic, operands):
     o = _ops(operands); _need(o, 3, mnemonic)
     rd, rs1, rs2 = (reg_num(x) for x in o)
-    funct3, funct7 = R_FUNCT[mnemonic]
+    if mnemonic in M_FUNCT:
+        isa = ISA_MODE['isa']
+        if isa == 'rv32i' or (isa == 'zmmul' and M_FUNCT[mnemonic] >= 0b100):
+            raise ValueError(f"'{mnemonic.lower()}' is not in the selected ISA ({isa}); use --isa rv32im")
+        funct3, funct7 = M_FUNCT[mnemonic], 0b0000001
+    else:
+        funct3, funct7 = R_FUNCT[mnemonic]
     return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | OP_RTYPE
 
 
@@ -378,8 +396,12 @@ def assemble(text, data_labels=None):
     for idx, (mnemonic, _, operands, raw) in enumerate(instrs):
         addr = idx * 4
         try:
-            if mnemonic in R_FUNCT:
+            if mnemonic in R_FUNCT or mnemonic in M_FUNCT:
                 code = encode_rtype(mnemonic, operands)
+            elif mnemonic in ('ECALL', 'EBREAK'):
+                if operands.strip():
+                    raise ValueError(f"'{mnemonic.lower()}' takes no operands")
+                code = 0x00000073 if mnemonic == 'ECALL' else 0x00100073
             elif mnemonic in ITYPE_FUNCT3:
                 code = encode_itype_alu(mnemonic, operands)
             elif mnemonic in SHIFT_IMM:
@@ -451,7 +473,9 @@ def write_hex_file(codes, filename, depth, word_desc):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RV32I assembler for the single-cycle CPU project")
+    ap = argparse.ArgumentParser(description="RV32I / RV32IM assembler for the RISC-V CPU projects")
+    ap.add_argument('--isa', choices=['rv32i', 'zmmul', 'rv32im'], default='rv32im',
+                    help='instruction set of the core: rv32i (default for RISC-V-SC), zmmul, rv32im (default)')
     ap.add_argument('source', help='assembly source file')
     ap.add_argument('--imem-depth', type=int, default=DEFAULT_IMEM_DEPTH,
                     help=f'instruction memory depth in words (default {DEFAULT_IMEM_DEPTH})')
@@ -459,6 +483,7 @@ def main():
                     help=f'data memory depth in words (default {DEFAULT_DMEM_DEPTH})')
     ap.add_argument('--outdir', default='.', help='where to write program.hex / data.hex')
     args = ap.parse_args()
+    ISA_MODE['isa'] = args.isa
 
     with open(args.source) as f:
         full_text = f.read()
@@ -477,9 +502,10 @@ def main():
     # RV32I has no HALT opcode; the convention is a self-loop so a program
     # that runs off the end doesn't execute the zero padding. Auto-append
     # one unless the program already ends with "jal x0, ...".
-    if not results or not (results[-1][1] == 'JAL' and results[-1][2].replace(' ', '').startswith('x0,')):
+    if not results or not ((results[-1][1] == 'JAL' and results[-1][2].replace(' ', '').startswith('x0,'))
+                           or results[-1][1] in ('ECALL', 'EBREAK')):
         codes.append(0x0000006F)  # jal x0, 0
-        print("(No trailing 'jal x0, ...' found - auto-appended a self-loop 'jal x0, 0' at the end.)")
+        print("(No trailing 'jal x0, ...', ecall or ebreak found - auto-appended a self-loop 'jal x0, 0' at the end.)")
         print()
 
     os.makedirs(args.outdir, exist_ok=True)
